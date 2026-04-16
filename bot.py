@@ -546,14 +546,23 @@ class SwapBot:
                 "last_trade_ts": 0,
                 "day": self._day_key(),
                 "daily_notional_usd": 0.0,
+                "open_position": None,
             }
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
+            loaded = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                loaded = {}
+            loaded.setdefault("last_trade_ts", 0)
+            loaded.setdefault("day", self._day_key())
+            loaded.setdefault("daily_notional_usd", 0.0)
+            loaded.setdefault("open_position", None)
+            return loaded
         except Exception:
             return {
                 "last_trade_ts": 0,
                 "day": self._day_key(),
                 "daily_notional_usd": 0.0,
+                "open_position": None,
             }
 
     def _save_state(self) -> None:
@@ -586,6 +595,8 @@ class SwapBot:
         amount_usd = data.get("amount_usd")
         trigger_price = data.get("trigger_price")
         trigger_condition = str(data.get("trigger_condition", "")).upper().strip()
+        take_profit_price = data.get("take_profit_price")
+        stop_price = data.get("stop_price")
         if trigger_condition not in {"GTE", "LTE"}:
             trigger_condition = ""
         try:
@@ -593,11 +604,23 @@ class SwapBot:
         except Exception:
             trigger_price = None
         try:
+            take_profit_price = float(take_profit_price) if take_profit_price is not None else None
+        except Exception:
+            take_profit_price = None
+        try:
+            stop_price = float(stop_price) if stop_price is not None else None
+        except Exception:
+            stop_price = None
+        try:
             amount_usd = float(amount_usd) if amount_usd is not None else None
         except Exception:
             amount_usd = None
         if trigger_price is not None and (not trigger_price > 0):
             trigger_price = None
+        if take_profit_price is not None and (not take_profit_price > 0):
+            take_profit_price = None
+        if stop_price is not None and (not stop_price > 0):
+            stop_price = None
         if amount_usd is not None and (not amount_usd > 0):
             amount_usd = None
         if action not in {"BUY", "SELL", "HOLD"}:
@@ -610,9 +633,147 @@ class SwapBot:
             "amount_usd": amount_usd,
             "trigger_price": trigger_price,
             "trigger_condition": trigger_condition,
+            "take_profit_price": take_profit_price,
+            "stop_price": stop_price,
             "intent": data.get("intent") if isinstance(data.get("intent"), dict) else None,
             "signature": str(data.get("signature", "")).strip() or None,
         }
+
+    @staticmethod
+    def _as_pos_float(value: Any) -> float | None:
+        try:
+            v = float(value)
+            if v > 0:
+                return v
+            return None
+        except Exception:
+            return None
+
+    def _active_position(self) -> Dict[str, Any] | None:
+        p = self.state.get("open_position")
+        return p if isinstance(p, dict) else None
+
+    def _clear_position(self) -> None:
+        if self.state.get("open_position") is None:
+            return
+        self.state["open_position"] = None
+        self._save_state()
+
+    def _set_position_after_buy(self, signal: Dict[str, Any], result: Dict[str, Any]) -> None:
+        tp = self._as_pos_float(signal.get("take_profit_price"))
+        sp = self._as_pos_float(signal.get("stop_price"))
+        if tp is None and sp is None:
+            return
+        amount_out_est = 0
+        try:
+            amount_out_est = int(result.get("amount_out_est") or 0)
+        except Exception:
+            amount_out_est = 0
+        if amount_out_est <= 0:
+            try:
+                amount_out_est = int((result.get("route") or {}).get("amount_out") or 0)
+            except Exception:
+                amount_out_est = 0
+        if amount_out_est <= 0:
+            try:
+                amount_out_est = int(result.get("amount_out_min") or 0)
+            except Exception:
+                amount_out_est = 0
+        exit_amount_quote = (
+            float(amount_out_est) / float(10 ** int(self.cfg.quote_token_decimals))
+            if amount_out_est > 0
+            else self._as_pos_float(signal.get("amount_usd"))
+        )
+        if exit_amount_quote is None or exit_amount_quote <= 0:
+            return
+        self.state["open_position"] = {
+            "entry_signal_id": str(signal.get("signal_id", "")).strip(),
+            "entry_action": "BUY",
+            "take_profit_price": tp,
+            "stop_price": sp,
+            "exit_amount_quote": float(exit_amount_quote),
+            "opened_at": int(time.time()),
+            "last_price": None,
+        }
+        self._save_state()
+        print(
+            f"[position] armed tp/sp tp={tp if tp is not None else '-'} "
+            f"sp={sp if sp is not None else '-'} exit_quote={exit_amount_quote:.8f}"
+        )
+
+    def _sync_position_after_trade(self, signal: Dict[str, Any], result: Dict[str, Any]) -> None:
+        action = str(signal.get("action", "")).upper().strip()
+        if action == "BUY":
+            self._set_position_after_buy(signal, result)
+            return
+        if action == "SELL":
+            self._clear_position()
+
+    def _evaluate_position_exit(self) -> tuple[bool, str, Dict[str, Any] | None]:
+        pos = self._active_position()
+        if not pos:
+            return False, "no_position", None
+        if str(pos.get("entry_action", "")).upper() != "BUY":
+            self._clear_position()
+            return False, "invalid_position", None
+
+        tp = self._as_pos_float(pos.get("take_profit_price"))
+        sp = self._as_pos_float(pos.get("stop_price"))
+        if tp is None and sp is None:
+            self._clear_position()
+            return False, "empty_tp_sp", None
+
+        current_price = self._get_pair_price_quote_per_base()
+        if not current_price > 0:
+            return False, "price_unavailable", None
+        pos["last_price"] = current_price
+        self.state["open_position"] = pos
+        self._save_state()
+
+        if tp is not None and current_price >= tp:
+            return True, f"TP hit {current_price:.8f} >= {tp:.8f}", pos
+        if sp is not None and current_price <= sp:
+            return True, f"SP hit {current_price:.8f} <= {sp:.8f}", pos
+        return False, f"대기: price={current_price:.8f} tp={tp} sp={sp}", pos
+
+    def _execute_position_exit_if_needed(self) -> bool:
+        should_exit, reason, pos = self._evaluate_position_exit()
+        if not should_exit:
+            if pos and not reason.startswith("대기:"):
+                print(f"[position] {reason}")
+            return False
+        if not pos:
+            return False
+
+        exit_amount_quote = self._as_pos_float(pos.get("exit_amount_quote"))
+        if exit_amount_quote is None:
+            self._clear_position()
+            raise RuntimeError("open_position exit amount 값이 올바르지 않습니다")
+
+        synthetic_signal: Dict[str, Any] = {
+            "signal_id": f"local_exit_{int(time.time())}",
+            "action": "SELL",
+            "confidence": 1.0,
+            "reason": f"AUTO_EXIT {reason}",
+            "amount_usd": float(exit_amount_quote),
+            "trigger_price": None,
+            "trigger_condition": "",
+            "take_profit_price": None,
+            "stop_price": None,
+            "intent": None,
+            "signature": None,
+        }
+        print(f"[position] auto-exit start: {reason} amount_quote={exit_amount_quote:.8f}")
+        if self.cfg.paper_mode:
+            result = self._paper_swap(synthetic_signal)
+        else:
+            # auto exit is local risk management path, so it is executed directly.
+            result = self._live_swap(synthetic_signal)
+        self._increase_notional(float(result.get("amount_used") or 0.0))
+        self._append_log({"status": "executed", "signal": synthetic_signal, "result": result})
+        print(f"[executed] {result}")
+        self._clear_position()
+        return True
 
     def _pending_signal_url(self) -> str:
         url = str(self.cfg.signal_url or "").strip()
@@ -950,6 +1111,7 @@ class SwapBot:
             "amount_used": amount_used,
             "amount_in": amount_in,
             "amount_out_min": amount_out_min,
+            "amount_out_est": out_expected,
             "tx_hash": tx_hash.hex(),
             "approve_hash": approve_hash,
         }
@@ -1043,6 +1205,7 @@ class SwapBot:
             "amount_used": float(amount_used),
             "amount_in": int(amount_in),
             "amount_out_min": int(amount_out_min),
+            "amount_out_est": int(amount_out_min),
             "tx_hash": tx_hash.hex(),
             "guard_address": self.cfg.execution_guard_address,
         }
@@ -1063,6 +1226,7 @@ class SwapBot:
             "amount_used": amount_used,
             "amount_in": amount_in,
             "amount_out_min": amount_out_min,
+            "amount_out_est": out_expected,
             "tx_hash": "paper-simulated",
         }
 
@@ -1073,6 +1237,12 @@ class SwapBot:
         self._save_state()
 
     def run_once(self) -> None:
+        try:
+            self._execute_position_exit_if_needed()
+        except Exception as e:
+            self._append_log({"status": "error", "error": str(e), "signal": {"action": "SELL", "reason": "AUTO_EXIT"}})
+            print(f"[error] auto-exit failed: {e}")
+
         signals = self._fetch_signals()
         if not signals:
             self._append_log({"status": "skip", "reason": "대기 신호 없음", "signal": {"action": "HOLD"}})
@@ -1103,6 +1273,7 @@ class SwapBot:
                     else:
                         result = self._live_swap(signal)
                 self._increase_notional(float(result.get("amount_used") or 0.0))
+                self._sync_position_after_trade(signal, result)
                 self._append_log({"status": "executed", "signal": signal, "result": result})
                 print(f"[executed] {result}")
                 self._consume_signal(
@@ -1181,7 +1352,7 @@ def build_config() -> Config:
         rpc_url=env("RPC_URL"),
         chain_id=int(env("CHAIN_ID", "56")),
         paper_mode=env("PAPER_MODE", "1") in {"1", "true", "TRUE", "yes", "YES"},
-        poll_seconds=int(env("POLL_SECONDS", "20")),
+        poll_seconds=int(env("POLL_SECONDS", "1")),
         signal_url=env("SIGNAL_URL"),
         signal_token=signal_token,
         bot_config_url=bot_config_url,
@@ -1343,13 +1514,13 @@ def _interactive_menu() -> tuple[str, bool, int, bool, str]:
             return ("start", True, 50, False, "all")
         if raw == "3":
             limit_raw = input("History limit (default 50): ").strip()
-            side_raw = input("Side filter (all/buy/sell/hold, default all): ").strip().lower()
+            side_raw = input("Side filter (all/buy/hold, default all): ").strip().lower()
             as_json_raw = input("JSON output? (y/N): ").strip().lower()
             try:
                 limit = int(limit_raw) if limit_raw else 50
             except Exception:
                 limit = 50
-            side = side_raw if side_raw in {"all", "buy", "sell", "hold"} else "all"
+            side = side_raw if side_raw in {"all", "buy", "hold"} else "all"
             as_json = as_json_raw in {"y", "yes", "1", "true"}
             return ("history", False, max(1, limit), as_json, side)
         if raw == "4":
@@ -1387,9 +1558,9 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", help="print raw json lines")
     parser.add_argument(
         "--side",
-        choices=["all", "buy", "sell", "hold"],
+        choices=["all", "buy", "hold"],
         default="all",
-        help="history filter by side (all=buy+sell)",
+        help="history filter by side (all=buy+sell legacy)",
     )
     parser.add_argument(
         "--mode",
