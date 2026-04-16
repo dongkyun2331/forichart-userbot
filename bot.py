@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1274,7 +1275,15 @@ def _print_history(limit: int, as_json: bool = False, side: str = "all") -> None
         print(" | ".join(parts))
 
 
-def run_bot(once: bool = False) -> None:
+def _wait_for_menu_return(stop_event: threading.Event) -> None:
+    try:
+        input("\n[loop] Press Enter to return to menu / 엔터를 누르면 메뉴로 돌아갑니다: ")
+    except Exception:
+        pass
+    stop_event.set()
+
+
+def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
     cfg = build_config()
     bot = SwapBot(cfg)
     print(
@@ -1282,7 +1291,18 @@ def run_bot(once: bool = False) -> None:
         f"signal={cfg.signal_url} config={cfg.bot_config_url} "
         f"v2={cfg.router_address} v3={cfg.v3_router_address} fees={cfg.v3_fee_tiers}"
     )
+    stop_event: threading.Event | None = None
+    if interactive_loop and not once and sys.stdin.isatty():
+        stop_event = threading.Event()
+        threading.Thread(
+            target=_wait_for_menu_return,
+            args=(stop_event,),
+            daemon=True,
+        ).start()
     while True:
+        if stop_event and stop_event.is_set():
+            print("[loop] menu return requested / 메뉴 복귀 요청됨")
+            break
         try:
             bot.run_once()
         except Exception as e:
@@ -1290,7 +1310,18 @@ def run_bot(once: bool = False) -> None:
             bot._append_log({"status": "error", "error": str(e)})
         if once:
             break
-        time.sleep(cfg.poll_seconds)
+        slept = 0.0
+        while slept < float(cfg.poll_seconds):
+            if stop_event and stop_event.is_set():
+                break
+            step = min(0.2, float(cfg.poll_seconds) - slept)
+            if step <= 0:
+                break
+            time.sleep(step)
+            slept += step
+        if stop_event and stop_event.is_set():
+            print("[loop] stopped and back to menu / 루프 중지 후 메뉴로 복귀")
+            break
 
 
 def _interactive_menu() -> tuple[str, bool, int, bool, str]:
@@ -1304,7 +1335,10 @@ def _interactive_menu() -> tuple[str, bool, int, bool, str]:
         print("4) Change mode / 모드 변경 (paper/live)")
         print("5) Set wallet key / 프라이빗 키 입력")
         print("6) Change bot token / 봇토큰 변경")
-        raw = input("Choose (1/2/3/4/5/6, default 1): ").strip()
+        print("7) Exit / 종료")
+        raw = input("Choose (1/2/3/4/5/6/7, default 1): ").strip()
+        if raw == "7":
+            return ("exit", False, 50, False, "all")
         if raw == "2":
             return ("start", True, 50, False, "all")
         if raw == "3":
@@ -1378,15 +1412,25 @@ def main() -> None:
     mode = args.mode
     set_bot_token = args.set_bot_token
 
-    if not cmd and sys.stdin.isatty():
-        cmd, once, limit, as_json, side = _interactive_menu()
-    if not cmd:
-        cmd = "start"
     if set_bot_token is not None:
         _set_signal_token_interactive(set_bot_token)
     if mode:
         _set_mode(mode)
 
+    if not cmd and sys.stdin.isatty():
+        while True:
+            cmd_i, once_i, limit_i, as_json_i, side_i = _interactive_menu()
+            if cmd_i == "exit":
+                print("[menu] bye / 종료")
+                return
+            if cmd_i == "history":
+                _print_history(limit=limit_i, as_json=as_json_i, side=side_i)
+                continue
+            run_bot(once=once_i, interactive_loop=True)
+        return
+
+    if not cmd:
+        cmd = "start"
     if cmd == "history":
         _print_history(limit=limit, as_json=as_json, side=side)
         return
