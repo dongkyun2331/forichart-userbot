@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+data/*.json
+data/*.ndjson
+__pycache__/
+.venv/
