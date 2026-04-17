@@ -1520,13 +1520,13 @@ def _interactive_menu() -> tuple[str, bool, int, bool, str]:
             return ("start", True, 50, False, "all")
         if raw == "3":
             limit_raw = input("History limit (default 50): ").strip()
-            side_raw = input("Side filter (all/buy/hold, default all): ").strip().lower()
+            side_raw = input("Side filter (all/buy/sell/hold, default all): ").strip().lower()
             as_json_raw = input("JSON output? (y/N): ").strip().lower()
             try:
                 limit = int(limit_raw) if limit_raw else 50
             except Exception:
                 limit = 50
-            side = side_raw if side_raw in {"all", "buy", "hold"} else "all"
+            side = side_raw if side_raw in {"all", "buy", "sell", "hold"} else "all"
             as_json = as_json_raw in {"y", "yes", "1", "true"}
             return ("history", False, max(1, limit), as_json, side)
         if raw == "4":
@@ -1564,7 +1564,7 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", help="print raw json lines")
     parser.add_argument(
         "--side",
-        choices=["all", "buy", "hold"],
+        choices=["all", "buy", "sell", "hold"],
         default="all",
         help="history filter by side (all=buy+sell legacy)",
     )
