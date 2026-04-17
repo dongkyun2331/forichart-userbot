@@ -121,6 +121,26 @@ python bot.py serve-ai
 - `POST /api/analysis/chart-image`
 - `GET /api/analysis/chart-image/logs?limit=20`
 
+### 텔레그램 알림 연동
+
+`.env`에 아래 값을 설정하면 봇 이벤트를 텔레그램으로 받을 수 있습니다.
+
+```env
+TELEGRAM_ENABLED=1
+TELEGRAM_BOT_TOKEN=123456789:your_bot_token
+TELEGRAM_CHAT_ID=123456789
+TELEGRAM_NOTIFY_STARTUP=1
+TELEGRAM_NOTIFY_EXECUTED=1
+TELEGRAM_NOTIFY_ERROR=1
+TELEGRAM_NOTIFY_SKIP=0
+```
+
+알림 기본 동작:
+- 시작 알림 (`startup`)
+- 체결 알림 (`executed`)
+- 에러 알림 (`error`)
+- 스킵 알림 (`skip`, 기본 비활성)
+
 ### 필수 환경변수
 
 - `SIGNAL_URL` (예: `https://api.fori.kr/api/bot/signal`)
@@ -312,6 +332,26 @@ python bot.py serve-ai
 Proxy endpoints:
 - `POST /api/analysis/chart-image`
 - `GET /api/analysis/chart-image/logs?limit=20`
+
+### Telegram Notification Integration
+
+Set the following in `.env` to receive bot events in Telegram:
+
+```env
+TELEGRAM_ENABLED=1
+TELEGRAM_BOT_TOKEN=123456789:your_bot_token
+TELEGRAM_CHAT_ID=123456789
+TELEGRAM_NOTIFY_STARTUP=1
+TELEGRAM_NOTIFY_EXECUTED=1
+TELEGRAM_NOTIFY_ERROR=1
+TELEGRAM_NOTIFY_SKIP=0
+```
+
+Default notification behavior:
+- startup
+- executed
+- error
+- skip (disabled by default)
 
 ### Required Env
 

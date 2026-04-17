@@ -6,8 +6,10 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -23,6 +25,7 @@ BSC_DEFAULT_V3_ROUTER_ADDRESS = "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
 BSC_DEFAULT_V3_QUOTER_ADDRESS = "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"
 BSC_DEFAULT_V3_FEE_TIERS = "500,2500,10000"
 NEAR_DEFAULT_API_BASE = "https://cloud-api.near.ai/v1"
+NEAR_DEFAULT_MODEL = "openai/gpt-4o-mini"
 NATIVE_BNB_KEY = "native:bnb"
 WBNB_ADDRESS = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
@@ -309,6 +312,13 @@ def _mask_secret(value: str, prefix: int = 4, suffix: int = 3) -> str:
     return f"{raw[:prefix]}...{raw[-suffix:]}"
 
 
+def _truncate_text(value: Any, limit: int = 180) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
 def _near_api_status_line() -> str:
     load_dotenv(dotenv_path=ENV_PATH, override=False)
     base = os.getenv("NEAR_API_BASE", "").strip() or NEAR_DEFAULT_API_BASE
@@ -351,6 +361,259 @@ def _set_near_api_key_interactive(new_key: str | None = None) -> None:
     os.environ["NEAR_API_KEY"] = key
     print("[setup] NEAR_API_KEY saved to .env / .env에 저장했습니다")
     print(f"[setup] NEAR API status / 상태: {_near_api_status_line()}")
+
+
+def _resolve_ai_log_path() -> Path:
+    _ensure_env_file()
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
+    raw = os.getenv("AI_PROXY_LOG_FILE", "./data/ai_analysis_logs.ndjson").strip()
+    if not raw:
+        raw = "./data/ai_analysis_logs.ndjson"
+    p = Path(raw)
+    if not p.is_absolute():
+        p = APP_DIR / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _extract_chat_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _call_near_chart_image_analysis(
+    image: str,
+    symbol: str,
+    interval: str,
+    market: str,
+    note: str,
+    model: str = "",
+) -> tuple[str, Dict[str, Any]]:
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
+    near_api_base = os.getenv("NEAR_API_BASE", "").strip() or NEAR_DEFAULT_API_BASE
+    near_api_key = os.getenv("NEAR_API_KEY", "").strip()
+    near_model = str(model or "").strip() or os.getenv("NEAR_MODEL", "").strip() or NEAR_DEFAULT_MODEL
+    if not near_api_key:
+        raise RuntimeError("NEAR_API_KEY is not set")
+
+    prompt = (
+        "차트 이미지를 분석해서 한국어로 짧게 답해줘.\n"
+        "- 추세(상승/하락/횡보)\n"
+        "- 주요 지지/저항\n"
+        "- 패턴/시나리오\n"
+        "- 리스크 포인트\n"
+        "- 핵심만 bullet로"
+    )
+    meta: list[str] = []
+    if symbol:
+        meta.append(f"심볼={symbol}")
+    if interval:
+        meta.append(f"주기={interval}")
+    if market:
+        meta.append(f"마켓={market}")
+    if meta:
+        prompt += "\n정보: " + ", ".join(meta)
+    if note:
+        prompt += "\n추가요청: " + note
+
+    image_url = str(image or "").strip()
+    if image_url and not image_url.startswith("data:"):
+        image_url = "data:image/png;base64," + image_url
+
+    payload = {
+        "model": near_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a technical chart analyst. Be concise and practical.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            },
+        ],
+        "temperature": 0.2,
+        "max_tokens": 600,
+    }
+
+    url = near_api_base.rstrip("/") + "/chat/completions"
+    res = requests.post(
+        url,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {near_api_key}",
+        },
+        json=payload,
+        timeout=90,
+    )
+    if res.status_code >= 400:
+        raise RuntimeError(f"NEAR API error {res.status_code}: {res.text[:800]}")
+    raw: Dict[str, Any] = res.json() if res.content else {}
+    choices = raw.get("choices") if isinstance(raw, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("NEAR API response missing choices")
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    summary = _extract_chat_content_text(content)
+    if not summary:
+        summary = "분석 결과가 비어 있습니다."
+    return summary, raw
+
+
+def _append_ai_log(record: Dict[str, Any]) -> None:
+    path = _resolve_ai_log_path()
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _read_ai_logs(limit: int, symbol: str = "") -> list[Dict[str, Any]]:
+    path = _resolve_ai_log_path()
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out: list[Dict[str, Any]] = []
+    sym = str(symbol or "").strip().upper()
+    for raw in reversed(lines):
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(item, dict):
+            continue
+        if sym:
+            s = str(item.get("symbol") or "").strip().upper()
+            if s != sym:
+                continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def run_ai_proxy_server(host: str, port: int) -> None:
+    class AiProxyHandler(BaseHTTPRequestHandler):
+        server_version = "ForiUserBotAIProxy/1.0"
+
+        def _json(self, status: int, payload: Dict[str, Any]) -> None:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path not in {"/analysis/chart-image/logs", "/api/analysis/chart-image/logs"}:
+                self._json(404, {"error": "not found"})
+                return
+            qs = parse_qs(parsed.query or "")
+            try:
+                limit = int((qs.get("limit") or ["20"])[0])
+            except Exception:
+                limit = 20
+            limit = max(1, min(100, limit))
+            symbol = str((qs.get("symbol") or [""])[0]).strip()
+            items = _read_ai_logs(limit=limit, symbol=symbol)
+            self._json(200, {"items": items})
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path not in {"/analysis/chart-image", "/api/analysis/chart-image"}:
+                self._json(404, {"error": "not found"})
+                return
+            length_raw = self.headers.get("Content-Length", "0")
+            try:
+                length = int(length_raw)
+            except Exception:
+                length = 0
+            body_raw = self.rfile.read(max(0, length))
+            try:
+                body = json.loads(body_raw.decode("utf-8")) if body_raw else {}
+            except Exception:
+                self._json(400, {"error": "invalid json"})
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"error": "invalid payload"})
+                return
+
+            image = str(body.get("image") or "").strip()
+            symbol = str(body.get("symbol") or "").strip()
+            interval = str(body.get("interval") or "").strip()
+            market = str(body.get("market") or "").strip()
+            note = str(body.get("note") or "").strip()
+            model = str(body.get("model") or "").strip()
+            if not image:
+                self._json(400, {"error": "image is required"})
+                return
+
+            try:
+                summary, raw = _call_near_chart_image_analysis(
+                    image=image,
+                    symbol=symbol,
+                    interval=interval,
+                    market=market,
+                    note=note,
+                    model=model,
+                )
+            except Exception as e:
+                self._json(502, {"error": str(e)})
+                return
+
+            now_kst = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            record = {
+                "id": int(time.time() * 1000),
+                "symbol": symbol or None,
+                "interval": interval or None,
+                "market": market or None,
+                "note": note or None,
+                "summary": summary,
+                "created_at": now_kst,
+            }
+            try:
+                _append_ai_log(record)
+            except Exception as e:
+                print(f"[warn] ai log append failed: {e}")
+            self._json(200, {"summary": summary, "raw": raw})
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            # keep console concise
+            return
+
+    server = ThreadingHTTPServer((host, port), AiProxyHandler)
+    print(f"[ai-proxy] listening on http://{host}:{port}")
+    print("[ai-proxy] endpoints: POST /api/analysis/chart-image, GET /api/analysis/chart-image/logs")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        print("[ai-proxy] stopped")
 
 
 def _is_truthy(value: str) -> bool:
@@ -562,6 +825,22 @@ class SwapBot:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.state = self._load_state()
+        self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.telegram_enabled = _is_truthy(os.getenv("TELEGRAM_ENABLED", "0"))
+        self.telegram_notify_executed = _is_truthy(
+            os.getenv("TELEGRAM_NOTIFY_EXECUTED", "1")
+        )
+        self.telegram_notify_error = _is_truthy(os.getenv("TELEGRAM_NOTIFY_ERROR", "1"))
+        self.telegram_notify_skip = _is_truthy(os.getenv("TELEGRAM_NOTIFY_SKIP", "0"))
+        self.telegram_notify_startup = _is_truthy(
+            os.getenv("TELEGRAM_NOTIFY_STARTUP", "1")
+        )
+        try:
+            timeout_raw = os.getenv("TELEGRAM_TIMEOUT_SECONDS", "6").strip() or "6"
+            self.telegram_timeout_seconds = max(2.0, float(timeout_raw))
+        except Exception:
+            self.telegram_timeout_seconds = 6.0
 
         self._validate_config()
 
@@ -640,6 +919,100 @@ class SwapBot:
         }
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _is_telegram_ready(self) -> bool:
+        return bool(
+            self.telegram_enabled and self.telegram_bot_token and self.telegram_chat_id
+        )
+
+    def _send_telegram_message(self, text: str) -> None:
+        if not self._is_telegram_ready():
+            return
+        url = (
+            "https://api.telegram.org/bot"
+            + self.telegram_bot_token
+            + "/sendMessage"
+        )
+        payload = {
+            "chat_id": self.telegram_chat_id,
+            "text": str(text or "")[:3500],
+            "disable_web_page_preview": True,
+        }
+        try:
+            requests.post(url, json=payload, timeout=self.telegram_timeout_seconds)
+        except Exception as e:
+            print(f"[warn] telegram send failed: {e}")
+
+    def _notify_telegram_executed(
+        self, signal: Dict[str, Any], result: Dict[str, Any], reason: str = ""
+    ) -> None:
+        if not self.telegram_notify_executed:
+            return
+        action = str(signal.get("action", "-")).upper()
+        signal_id = str(signal.get("signal_id", "")).strip() or "-"
+        route = result.get("route") if isinstance(result, dict) else None
+        venue = ""
+        if isinstance(route, dict):
+            venue = str(route.get("venue", "")).strip()
+            fee = route.get("fee")
+            if venue == "v3" and fee is not None:
+                venue = f"{venue}:{fee}"
+        tx_hash = str(result.get("tx_hash", "")).strip() if isinstance(result, dict) else ""
+        amount_used = (
+            float(result.get("amount_used"))
+            if isinstance(result, dict) and result.get("amount_used") is not None
+            else None
+        )
+        mode = str(result.get("mode", "")).strip() if isinstance(result, dict) else ""
+        path = str(result.get("path", "")).strip() if isinstance(result, dict) else ""
+        lines = [
+            "Swap Bot Executed",
+            f"- action: {action}",
+            f"- signal_id: {signal_id}",
+        ]
+        if mode:
+            lines.append(f"- mode: {mode}{'/' + path if path else ''}")
+        if venue:
+            lines.append(f"- route: {venue}")
+        if amount_used is not None:
+            lines.append(f"- amount_used: {amount_used}")
+        if tx_hash:
+            lines.append(f"- tx: {tx_hash}")
+        if reason:
+            lines.append(f"- reason: {_truncate_text(reason, 200)}")
+        self._send_telegram_message("\n".join(lines))
+
+    def _notify_telegram_error(self, error: str, signal: Dict[str, Any] | None = None) -> None:
+        if not self.telegram_notify_error:
+            return
+        action = "-"
+        signal_id = "-"
+        if isinstance(signal, dict):
+            action = str(signal.get("action", "-")).upper()
+            signal_id = str(signal.get("signal_id", "")).strip() or "-"
+        lines = [
+            "Swap Bot Error",
+            f"- action: {action}",
+            f"- signal_id: {signal_id}",
+            f"- error: {_truncate_text(error, 400)}",
+        ]
+        self._send_telegram_message("\n".join(lines))
+
+    def _notify_telegram_skip(self, reason: str, signal: Dict[str, Any] | None = None) -> None:
+        if not self.telegram_notify_skip:
+            return
+        action = "-"
+        signal_id = "-"
+        if isinstance(signal, dict):
+            action = str(signal.get("action", "-")).upper()
+            signal_id = str(signal.get("signal_id", "")).strip() or "-"
+        lines = [
+            "Swap Bot Skipped",
+            f"- action: {action}",
+            f"- signal_id: {signal_id}",
+            f"- reason: {_truncate_text(reason, 240)}",
+        ]
+        self._send_telegram_message("\n".join(lines))
 
     @staticmethod
     def _normalize_signal_payload(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1296,11 +1669,13 @@ class SwapBot:
         except Exception as e:
             self._append_log({"status": "error", "error": str(e), "signal": {"action": "SELL", "reason": "AUTO_EXIT"}})
             print(f"[error] auto-exit failed: {e}")
+            self._notify_telegram_error(str(e), {"action": "SELL", "signal_id": "AUTO_EXIT"})
 
         signals = self._fetch_signals()
         if not signals:
             self._append_log({"status": "skip", "reason": "대기 신호 없음", "signal": {"action": "HOLD"}})
             print("[skip] 대기 신호 없음")
+            self._notify_telegram_skip("대기 신호 없음", {"action": "HOLD", "signal_id": ""})
             return
 
         executed_count = 0
@@ -1309,6 +1684,7 @@ class SwapBot:
             if not ok:
                 self._append_log({"status": "skip", "reason": reason, "signal": signal})
                 print(f"[skip] {reason} signal={signal}")
+                self._notify_telegram_skip(reason, signal)
                 continue
             try:
                 if self.cfg.paper_mode:
@@ -1330,6 +1706,11 @@ class SwapBot:
                 self._sync_position_after_trade(signal, result)
                 self._append_log({"status": "executed", "signal": signal, "result": result})
                 print(f"[executed] {result}")
+                self._notify_telegram_executed(
+                    signal,
+                    result,
+                    reason=str(signal.get("reason", "")).strip(),
+                )
                 self._consume_signal(
                     signal.get("signal_id", ""),
                     tx_hash=str(result.get("tx_hash") or ""),
@@ -1339,6 +1720,7 @@ class SwapBot:
             except Exception as e:
                 self._append_log({"status": "error", "error": str(e), "signal": signal})
                 print(f"[error] {e} signal={signal}")
+                self._notify_telegram_error(str(e), signal)
 
 
 
@@ -1516,6 +1898,17 @@ def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
         f"signal={cfg.signal_url} config={cfg.bot_config_url} "
         f"v2={cfg.router_address} v3={cfg.v3_router_address} fees={cfg.v3_fee_tiers}"
     )
+    if bot.telegram_notify_startup:
+        bot._send_telegram_message(
+            "\n".join(
+                [
+                    "Swap Bot Started",
+                    f"- paper_mode: {cfg.paper_mode}",
+                    f"- execution_mode: {cfg.execution_mode}",
+                    f"- poll_seconds: {cfg.poll_seconds}",
+                ]
+            )
+        )
     stop_event: threading.Event | None = None
     if interactive_loop and not once and sys.stdin.isatty():
         stop_event = threading.Event()
@@ -1530,6 +1923,7 @@ def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
         except Exception as e:
             print(f"[error] {e}")
             bot._append_log({"status": "error", "error": str(e)})
+            bot._notify_telegram_error(str(e))
         return
 
     while True:
@@ -1541,6 +1935,7 @@ def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
         except Exception as e:
             print(f"[error] {e}")
             bot._append_log({"status": "error", "error": str(e)})
+            bot._notify_telegram_error(str(e))
         slept = 0.0
         while slept < float(cfg.poll_seconds):
             if stop_event and stop_event.is_set():
@@ -1567,10 +1962,20 @@ def _interactive_menu() -> tuple[str, bool, int, bool, str]:
         print("5) Set wallet key / 프라이빗 키 입력")
         print("6) Change bot token / 봇토큰 변경")
         print(f"7) Change NEAR API key / NEAR API 키 변경 ({_near_api_status_line()})")
-        print("8) Exit / 종료")
-        raw = input("Choose (1/2/3/4/5/6/7/8, default 1): ").strip()
-        if raw == "8":
+        print("8) Start AI proxy server / AI 프록시 서버 실행")
+        print("9) Exit / 종료")
+        raw = input("Choose (1/2/3/4/5/6/7/8/9, default 1): ").strip()
+        if raw == "9":
             return ("exit", False, 50, False, "all")
+        if raw == "8":
+            try:
+                load_dotenv(dotenv_path=ENV_PATH, override=False)
+                host = os.getenv("AI_PROXY_HOST", "127.0.0.1").strip() or "127.0.0.1"
+                port = int((os.getenv("AI_PROXY_PORT", "18081").strip() or "18081"))
+                run_ai_proxy_server(host=host, port=port)
+            except Exception as e:
+                print(f"[menu] ai proxy failed / AI 프록시 실행 실패: {e}")
+            continue
         if raw == "7":
             try:
                 _set_near_api_key_interactive()
@@ -1617,8 +2022,8 @@ def main() -> None:
     parser.add_argument(
         "cmd",
         nargs="?",
-        choices=["start", "history"],
-        help="start bot loop or show history",
+        choices=["start", "history", "serve-ai"],
+        help="start bot loop, show history, or run ai proxy server",
     )
     parser.add_argument("--once", action="store_true", help="run only one cycle")
     parser.add_argument("--limit", type=int, default=50, help="number of rows to show")
@@ -1646,6 +2051,8 @@ def main() -> None:
         const="",
         help="set NEAR_API_KEY (when value omitted, prompt in tty)",
     )
+    parser.add_argument("--host", default="", help="AI proxy host override")
+    parser.add_argument("--port", type=int, default=0, help="AI proxy port override")
 
     args = parser.parse_args()
     cmd = args.cmd
@@ -1656,6 +2063,8 @@ def main() -> None:
     mode = args.mode
     set_bot_token = args.set_bot_token
     set_near_api_key = args.set_near_api_key
+    host_arg = str(args.host or "").strip()
+    port_arg = int(args.port or 0)
 
     if set_bot_token is not None:
         _set_signal_token_interactive(set_bot_token)
@@ -1680,6 +2089,12 @@ def main() -> None:
         cmd = "start"
     if cmd == "history":
         _print_history(limit=limit, as_json=as_json, side=side)
+        return
+    if cmd == "serve-ai":
+        load_dotenv(dotenv_path=ENV_PATH, override=False)
+        host = host_arg or (os.getenv("AI_PROXY_HOST", "127.0.0.1").strip() or "127.0.0.1")
+        port = port_arg or int((os.getenv("AI_PROXY_PORT", "18081").strip() or "18081"))
+        run_ai_proxy_server(host=host, port=port)
         return
     run_bot(once=once)
 
