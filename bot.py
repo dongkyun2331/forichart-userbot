@@ -12,6 +12,12 @@ from typing import Dict, Any
 import requests
 from dotenv import load_dotenv
 from web3 import Web3
+try:
+    import websocket
+    from websocket import WebSocketTimeoutException
+except Exception:  # optional at runtime
+    websocket = None  # type: ignore[assignment]
+    WebSocketTimeoutException = Exception  # type: ignore[assignment]
 
 APP_DIR = Path(__file__).resolve().parent
 ENV_EXAMPLE_PATH = APP_DIR / ".env.example"
@@ -206,6 +212,7 @@ class Config:
     paper_mode: bool
     poll_seconds: int
     signal_url: str
+    signal_ws_url: str
     signal_token: str
     bot_config_url: str
     execution_mode: str
@@ -783,6 +790,28 @@ class SwapBot:
             return url + "pending"
         return url
 
+    def _signal_ws_url(self) -> str:
+        explicit = str(self.cfg.signal_ws_url or "").strip()
+        if explicit:
+            return explicit
+        base = str(self.cfg.signal_url or "").strip()
+        if not base:
+            return ""
+        if base.startswith("https://"):
+            ws_url = "wss://" + base[len("https://") :]
+        elif base.startswith("http://"):
+            ws_url = "ws://" + base[len("http://") :]
+        elif base.startswith("wss://") or base.startswith("ws://"):
+            ws_url = base
+        else:
+            return ""
+        ws_url = ws_url.rstrip("/")
+        if ws_url.endswith("/bot/signal/pending"):
+            return ws_url[: -len("/pending")] + "/ws"
+        if ws_url.endswith("/bot/signal"):
+            return ws_url + "/ws"
+        return ws_url
+
     def _consume_signal_url(self, signal_id: str) -> str:
         base = str(self.cfg.signal_url or "").strip().rstrip("/")
         return f"{base}/{signal_id}/consume"
@@ -1286,6 +1315,68 @@ class SwapBot:
                 self._append_log({"status": "error", "error": str(e), "signal": signal})
                 print(f"[error] {e} signal={signal}")
 
+    def run_socket_loop(self, stop_event: threading.Event | None = None) -> None:
+        if websocket is None:
+            raise RuntimeError("websocket-client not installed. pip install -r requirements.txt")
+        ws_url = self._signal_ws_url()
+        if not ws_url:
+            raise RuntimeError("SIGNAL_WS_URL을 결정할 수 없습니다")
+        headers: list[str] = []
+        if self.cfg.signal_token:
+            headers.append(f"Authorization: Bearer {self.cfg.signal_token}")
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+            ws_conn = None
+            try:
+                ws_conn = websocket.create_connection(ws_url, header=headers, timeout=30)
+                ws_conn.settimeout(20)
+                print(f"[ws] connected {ws_url}")
+                # reconnect 직후 누락 신호 보정
+                self.run_once()
+                while True:
+                    if stop_event and stop_event.is_set():
+                        try:
+                            ws_conn.close()
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        raw = ws_conn.recv()
+                    except WebSocketTimeoutException:
+                        try:
+                            ws_conn.ping("ping")
+                        except Exception as e:
+                            raise RuntimeError(f"ws ping failed: {e}") from e
+                        continue
+                    if raw is None:
+                        raise RuntimeError("ws closed")
+                    text = str(raw).strip()
+                    if not text:
+                        continue
+                    should_run = False
+                    try:
+                        payload = json.loads(text)
+                        msg_type = str(payload.get("type", "")).strip().lower()
+                        if msg_type == "bot_signal_updated":
+                            should_run = True
+                    except Exception:
+                        # 비정형 텍스트 수신 시에도 안전하게 1회 동기화
+                        should_run = True
+                    if should_run:
+                        self.run_once()
+            except Exception as e:
+                print(f"[ws] reconnect in 1s: {e}")
+                if stop_event and stop_event.is_set():
+                    break
+                time.sleep(1)
+            finally:
+                if ws_conn is not None:
+                    try:
+                        ws_conn.close()
+                    except Exception:
+                        pass
+
 
 
 def build_config() -> Config:
@@ -1354,6 +1445,7 @@ def build_config() -> Config:
         paper_mode=env("PAPER_MODE", "1") in {"1", "true", "TRUE", "yes", "YES"},
         poll_seconds=int(env("POLL_SECONDS", "1")),
         signal_url=env("SIGNAL_URL"),
+        signal_ws_url=env("SIGNAL_WS_URL"),
         signal_token=signal_token,
         bot_config_url=bot_config_url,
         execution_mode=env("EXECUTION_MODE", "direct").lower(),
@@ -1459,7 +1551,7 @@ def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
     bot = SwapBot(cfg)
     print(
         f"[start] paper_mode={cfg.paper_mode} poll={cfg.poll_seconds}s "
-        f"signal={cfg.signal_url} config={cfg.bot_config_url} "
+        f"signal={cfg.signal_url} ws={cfg.signal_ws_url or '-'} config={cfg.bot_config_url} "
         f"v2={cfg.router_address} v3={cfg.v3_router_address} fees={cfg.v3_fee_tiers}"
     )
     stop_event: threading.Event | None = None
@@ -1470,6 +1562,22 @@ def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
             args=(stop_event,),
             daemon=True,
         ).start()
+    if once:
+        try:
+            bot.run_once()
+        except Exception as e:
+            print(f"[error] {e}")
+            bot._append_log({"status": "error", "error": str(e)})
+        return
+
+    ws_ready = websocket is not None and bool(bot._signal_ws_url())
+    if ws_ready:
+        try:
+            bot.run_socket_loop(stop_event=stop_event)
+            return
+        except Exception as e:
+            print(f"[warn] websocket mode failed, fallback to polling: {e}")
+
     while True:
         if stop_event and stop_event.is_set():
             print("[loop] menu return requested / 메뉴 복귀 요청됨")
@@ -1479,8 +1587,6 @@ def run_bot(once: bool = False, interactive_loop: bool = False) -> None:
         except Exception as e:
             print(f"[error] {e}")
             bot._append_log({"status": "error", "error": str(e)})
-        if once:
-            break
         slept = 0.0
         while slept < float(cfg.poll_seconds):
             if stop_event and stop_event.is_set():
