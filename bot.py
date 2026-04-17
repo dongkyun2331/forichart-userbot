@@ -22,6 +22,7 @@ BSC_DEFAULT_ROUTER_ADDRESS = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
 BSC_DEFAULT_V3_ROUTER_ADDRESS = "0x1b81D678ffb9C0263b24A97847620C99d213eB14"
 BSC_DEFAULT_V3_QUOTER_ADDRESS = "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"
 BSC_DEFAULT_V3_FEE_TIERS = "500,2500,10000"
+NEAR_DEFAULT_API_BASE = "https://cloud-api.near.ai/v1"
 NATIVE_BNB_KEY = "native:bnb"
 WBNB_ADDRESS = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
@@ -297,6 +298,59 @@ def _set_signal_token_interactive(new_token: str | None = None) -> None:
     _upsert_env_value("SIGNAL_TOKEN", token)
     os.environ["SIGNAL_TOKEN"] = token
     print("[setup] SIGNAL_TOKEN saved to .env / .env에 저장했습니다")
+
+
+def _mask_secret(value: str, prefix: int = 4, suffix: int = 3) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "(not set)"
+    if len(raw) <= (prefix + suffix + 1):
+        return "*" * len(raw)
+    return f"{raw[:prefix]}...{raw[-suffix:]}"
+
+
+def _near_api_status_line() -> str:
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
+    base = os.getenv("NEAR_API_BASE", "").strip() or NEAR_DEFAULT_API_BASE
+    key = os.getenv("NEAR_API_KEY", "").strip()
+    return f"base={base}, key={_mask_secret(key)}"
+
+
+def _set_near_api_key_interactive(new_key: str | None = None) -> None:
+    _ensure_env_file()
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
+    if not sys.stdin.isatty() and not str(new_key or "").strip():
+        raise RuntimeError("터미널 입력 환경에서만 NEAR_API_KEY 변경이 가능합니다")
+
+    current_base = os.getenv("NEAR_API_BASE", "").strip() or NEAR_DEFAULT_API_BASE
+    current_key = os.getenv("NEAR_API_KEY", "").strip()
+
+    if sys.stdin.isatty():
+        typed_base = input(
+            f"NEAR API base (blank=keep) / NEAR API base 입력 (엔터=유지) [{current_base}]: "
+        ).strip()
+        near_api_base = typed_base or current_base
+    else:
+        near_api_base = current_base
+    _upsert_env_value("NEAR_API_BASE", near_api_base)
+    os.environ["NEAR_API_BASE"] = near_api_base
+
+    key = (new_key or "").strip()
+    if not key:
+        prompt = (
+            "Enter NEAR_API_KEY (blank=keep current) / "
+            "NEAR_API_KEY 입력 (엔터=유지): "
+        )
+        key = input(prompt).strip() if sys.stdin.isatty() else ""
+    if not key:
+        key = current_key
+    if not key:
+        raise RuntimeError("NEAR_API_KEY가 비어 있습니다")
+
+    _upsert_env_value("NEAR_API_KEY", key)
+    os.environ["NEAR_API_KEY"] = key
+    print("[setup] NEAR_API_KEY saved to .env / .env에 저장했습니다")
+    print(f"[setup] NEAR API status / 상태: {_near_api_status_line()}")
 
 
 def _is_truthy(value: str) -> bool:
@@ -1512,10 +1566,17 @@ def _interactive_menu() -> tuple[str, bool, int, bool, str]:
         print("4) Change mode / 모드 변경 (paper/live)")
         print("5) Set wallet key / 프라이빗 키 입력")
         print("6) Change bot token / 봇토큰 변경")
-        print("7) Exit / 종료")
-        raw = input("Choose (1/2/3/4/5/6/7, default 1): ").strip()
-        if raw == "7":
+        print(f"7) Change NEAR API key / NEAR API 키 변경 ({_near_api_status_line()})")
+        print("8) Exit / 종료")
+        raw = input("Choose (1/2/3/4/5/6/7/8, default 1): ").strip()
+        if raw == "8":
             return ("exit", False, 50, False, "all")
+        if raw == "7":
+            try:
+                _set_near_api_key_interactive()
+            except Exception as e:
+                print(f"[menu] NEAR API key update failed / NEAR API 키 변경 실패: {e}")
+            continue
         if raw == "2":
             return ("start", True, 50, False, "all")
         if raw == "3":
@@ -1579,6 +1640,12 @@ def main() -> None:
         const="",
         help="set SIGNAL_TOKEN (when value omitted, prompt in tty)",
     )
+    parser.add_argument(
+        "--set-near-api-key",
+        nargs="?",
+        const="",
+        help="set NEAR_API_KEY (when value omitted, prompt in tty)",
+    )
 
     args = parser.parse_args()
     cmd = args.cmd
@@ -1588,9 +1655,12 @@ def main() -> None:
     side = str(args.side or "all")
     mode = args.mode
     set_bot_token = args.set_bot_token
+    set_near_api_key = args.set_near_api_key
 
     if set_bot_token is not None:
         _set_signal_token_interactive(set_bot_token)
+    if set_near_api_key is not None:
+        _set_near_api_key_interactive(set_near_api_key)
     if mode:
         _set_mode(mode)
 
